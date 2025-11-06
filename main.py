@@ -1,83 +1,22 @@
 # Requires: python-multipart package for file uploads
 # Install: pip install fastapi uvicorn python-multipart
 
-from fastapi import FastAPI, Request
-import time, os
+from fastapi import FastAPI, Request, UploadFile
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+import time
+import os
 import requests
 import socket
 import ipaddress
 from typing import Dict, Any
+import asyncio
 
 app = FastAPI(
     title="Internet Speed Test API",
     version="3.0.0",
-    description="API for testing upload and download speeds with network information"
+    description="API for testing real client network speeds"
 )
-
-# Helper to generate random data
-def random_data(size_mb: int):
-    return os.urandom(size_mb * 1024 * 1024)
-
-# Simulate network conditions
-def simulate_network_transfer(size_mb: float, direction: str = "download"):
-    """Simulate realistic network transfer with latency and bandwidth limits."""
-    # Typical latency: 10-100ms
-    latency = 0.05  # 50ms base latency
-    
-    # Simulate bandwidth limits (in Mbps)
-    max_speeds = {
-        "download": 100,  # 100 Mbps download
-        "upload": 20      # 20 Mbps upload
-    }
-    
-    # Calculate theoretical transfer time based on bandwidth
-    bits = size_mb * 8  # Convert MB to Mb
-    bandwidth_time = bits / max_speeds[direction]
-    
-    # Add latency and some random variation (±10%)
-    import random
-    variation = random.uniform(0.9, 1.1)
-    return (bandwidth_time + latency) * variation
-
-# Perform a simulated download test
-def test_download(size_mb: int = 5):
-    start = time.time()
-    _ = random_data(size_mb)  # Generate data
-    
-    # Simulate network transfer
-    time.sleep(simulate_network_transfer(size_mb, "download"))
-    
-    duration = time.time() - start
-    speed_mbps = (size_mb * 8) / duration if duration > 0 else 0
-    return {
-        "size_mb": size_mb,
-        "duration_sec": round(duration, 3),
-        "speed_mbps": round(min(speed_mbps, 100), 2)  # Cap at 100 Mbps
-    }
-
-# Perform a simulated upload test (reads local file)
-def test_upload(file_path: str = "testfile.bin"):
-    if not os.path.exists(file_path):
-        # Auto-create test file if missing
-        with open(file_path, "wb") as f:
-            f.write(os.urandom(5 * 1024 * 1024))  # 5 MB test file
-
-    start = time.time()
-    with open(file_path, "rb") as f:
-        content = f.read()
-    
-    # Simulate network transfer
-    size_mb = len(content) / (1024 * 1024)
-    time.sleep(simulate_network_transfer(size_mb, "upload"))
-    
-    duration = time.time() - start
-    speed_mbps = (size_mb * 8) / duration if duration > 0 else 0
-    return {
-        "file": file_path,
-        "size_mb": round(size_mb, 2),
-        "duration_sec": round(duration, 3),
-        "speed_mbps": round(min(speed_mbps, 20), 2)  # Cap at 20 Mbps
-    }
 
 def is_private_ip(ip: str) -> bool:
     """Check if IP address is private."""
@@ -111,7 +50,6 @@ async def get_network_details(request: Request) -> Dict[str, Any]:
                 "hostname": hostname,
                 "ip": server_ip,
                 "is_private": is_private_ip(server_ip),
-                "docker": hostname.startswith('') and len(hostname) == 12,
             },
             "client": {
                 "ip": client_ip,
@@ -127,15 +65,18 @@ async def get_network_details(request: Request) -> Dict[str, Any]:
         
         # Only try geolocation for public IPs
         if public_ip and not is_private_ip(public_ip):
-            ip_info = requests.get(f"http://ip-api.com/json/{public_ip}", timeout=2).json()
-            if ip_info.get('status') == 'success':
-                network_info["client"]["location"] = {
-                    "country": ip_info.get("country", "Unknown"),
-                    "city": ip_info.get("city", "Unknown"),
-                    "isp": ip_info.get("isp", "Unknown"),
-                    "region": ip_info.get("regionName", "Unknown"),
-                    "timezone": ip_info.get("timezone", "Unknown")
-                }
+            try:
+                ip_info = requests.get(f"http://ip-api.com/json/{public_ip}", timeout=2).json()
+                if ip_info.get('status') == 'success':
+                    network_info["client"]["location"] = {
+                        "country": ip_info.get("country", "Unknown"),
+                        "city": ip_info.get("city", "Unknown"),
+                        "isp": ip_info.get("isp", "Unknown"),
+                        "region": ip_info.get("regionName", "Unknown"),
+                        "timezone": ip_info.get("timezone", "Unknown")
+                    }
+            except:
+                pass
         
         return network_info
     except Exception as e:
@@ -145,89 +86,167 @@ async def get_network_details(request: Request) -> Dict[str, Any]:
             "client": {"ip": request.client.host}
         }
 
-def run_multiple_tests(test_func, attempts: int = 3, **kwargs):
-    """Run multiple tests and return the best result."""
-    results = []
-    for _ in range(attempts):
-        result = test_func(**kwargs)
-        results.append(result)
-        time.sleep(0.5)  # Brief pause between tests
-    
-    # Return the result with highest speed
-    return max(results, key=lambda x: x["speed_mbps"])
+async def measure_latency(request: Request) -> float:
+    """Measure latency by timing a simple request."""
+    start = time.time()
+    # Client should send timestamp and we calculate RTT
+    # For now, return minimal processing time
+    await asyncio.sleep(0.001)  # Simulate minimal processing
+    return round((time.time() - start) * 1000, 2)
 
 @app.get("/", tags=["Info"])
 async def root():
     """Get API information and available endpoints."""
     return {
         "message": "Welcome to the Internet Speed Test API",
+        "note": "This API measures YOUR (client's) network speed",
+        "base_url": "https://speedtest-api-1q3l.onrender.com",
         "routes": {
             "info": "/",
             "docs": "/docs",
-            "download_test": "/api/speedtest/download",
-            "upload_test": "/api/speedtest/upload",
-            "full_test": "/api/speedtest/test"
+            "ping": "/api/speedtest/ping",
+            "download": "/api/speedtest/download?size_mb=10",
+            "upload": "/api/speedtest/upload (POST with file)",
+            "test": "/api/speedtest/test",
+            "network": "/api/speedtest/network"
         }
+    }
+
+@app.get("/api/speedtest/ping", tags=["Speed Test"])
+async def test_ping(request: Request):
+    """Measure latency between client and server."""
+    return {
+        "timestamp": time.time(),
+        "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "note": "Client should measure round-trip time (RTT)"
     }
 
 @app.get("/api/speedtest/download", tags=["Speed Test"])
-async def download_test(size_mb: int = 5):
+async def test_download(size_mb: int = 10):
     """
-    Test download speed by simulating file download.
+    Stream random data for download speed test.
+    CLIENT must measure time from first to last byte.
     
-    Parameters:
-    - size_mb: Size of test data in megabytes (default: 5)
-    
-    Returns:
-    - Test results including speed in Mbps
+    Usage:
+    1. Record start time when first byte arrives
+    2. Record end time when last byte arrives
+    3. Calculate: speed_mbps = (size_mb * 8) / duration_seconds
     """
-    return run_multiple_tests(test_download, size_mb=size_mb)
+    def generate():
+        chunk_size = 256 * 1024  # 256KB chunks
+        total_bytes = size_mb * 1024 * 1024
+        bytes_sent = 0
+        
+        while bytes_sent < total_bytes:
+            chunk = os.urandom(min(chunk_size, total_bytes - bytes_sent))
+            bytes_sent += len(chunk)
+            yield chunk
 
-@app.get("/api/speedtest/upload", tags=["Speed Test"])
-async def upload_test(file_path: str = "testfile.bin"):
+    return StreamingResponse(
+        generate(),
+        media_type="application/octet-stream",
+        headers={
+            "Content-Length": str(size_mb * 1024 * 1024),
+            "X-Test-Start": str(time.time()),
+            "X-Size-MB": str(size_mb),
+            "Cache-Control": "no-cache"
+        }
+    )
+
+@app.post("/api/speedtest/upload", tags=["Speed Test"])
+async def test_upload(file: UploadFile):
     """
-    Test upload speed by simulating file upload.
-    
-    Parameters:
-    - file_path: Path to test file (default: testfile.bin)
-    
-    Returns:
-    - Test results including speed in Mbps
+    Receive file and measure upload speed.
+    This measures CLIENT's upload speed (how fast they can send to server).
     """
-    return run_multiple_tests(test_upload, file_path=file_path)
+    start_time = time.time()
+    size = 0
+    
+    chunk_size = 256 * 1024
+    while chunk := await file.read(chunk_size):
+        size += len(chunk)
+    
+    duration = time.time() - start_time
+    size_mb = size / (1024 * 1024)
+    speed_mbps = (size_mb * 8) / duration if duration > 0 else 0
+    
+    return {
+        "test_type": "upload",
+        "file": file.filename,
+        "size_mb": round(size_mb, 2),
+        "duration_sec": round(duration, 3),
+        "speed_mbps": round(speed_mbps, 2),
+        "note": "This is YOUR upload speed (client to server)"
+    }
 
 @app.get("/api/speedtest/test", tags=["Speed Test"])
-async def full_test(
-    request: Request,
-    file_path: str = "testfile.bin",
-    size_mb: int = 5
-):
+async def full_speed_test(request: Request):
     """
-    Run complete speed test including upload, download and network details.
+    Get network information and test instructions.
     
-    Parameters:
-    - file_path: Path to test file (default: testfile.bin)
-    - size_mb: Size of download test in megabytes (default: 5)
+    IMPORTANT: This endpoint only provides network info.
+    For actual speed measurements, you must:
     
-    Returns:
-    - Complete test results including:
-      * Download speed
-      * Upload speed
-      * Network details
+    1. Download Test:
+       - Call GET /api/speedtest/download?size_mb=10
+       - Measure time from first byte to last byte on CLIENT side
+       - Calculate: speed_mbps = (10 * 8) / duration_seconds
+    
+    2. Upload Test:
+       - Generate random data on client
+       - POST to /api/speedtest/upload
+       - Server returns your upload speed
+    
+    3. Latency Test:
+       - Call GET /api/speedtest/ping
+       - Measure round-trip time on CLIENT side
     """
-    download_result = run_multiple_tests(test_download, size_mb=size_mb)
-    upload_result = run_multiple_tests(test_upload, file_path=file_path)
+    
+    # Get network details
     network_details = await get_network_details(request)
-
+    
+    # Measure basic latency
+    latency = await measure_latency(request)
+    
     return {
-        "summary": {
-            "download_speed_mbps": download_result["speed_mbps"],
-            "upload_speed_mbps": upload_result["speed_mbps"],
-            "tests_per_direction": 3
+        "test_type": "speed_test_info",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "server_latency_ms": latency,
+        "network": network_details,
+        "instructions": {
+            "note": "This endpoint only provides info. For actual speeds:",
+            "download_test": {
+                "endpoint": "GET /api/speedtest/download?size_mb=10",
+                "client_action": "Measure time from first to last byte",
+                "calculation": "speed_mbps = (size_mb * 8) / duration_seconds"
+            },
+            "upload_test": {
+                "endpoint": "POST /api/speedtest/upload",
+                "client_action": "Send file, server returns your upload speed",
+                "note": "Server measures how fast it receives your data"
+            },
+            "latency_test": {
+                "endpoint": "GET /api/speedtest/ping",
+                "client_action": "Measure round-trip time (send request -> receive response)"
+            }
         },
-        "details": {
-            "download": download_result,
-            "upload": upload_result,
-            "network": network_details
+        "why_client_side": "Network speed must be measured by timing actual data transfer over the network. Server-side generation of random data doesn't measure network speed - it only measures server's memory/CPU speed.",
+        "example_clients": {
+            "curl_download": "time curl -o /dev/null https://speedtest-api-1q3l.onrender.com/api/speedtest/download?size_mb=10",
+            "curl_upload": "curl -X POST -F 'file=@testfile.bin' https://speedtest-api-1q3l.onrender.com/api/speedtest/upload",
+            "python": "requests.get('https://speedtest-api-1q3l.onrender.com/api/speedtest/download')",
+            "javascript": "fetch('https://speedtest-api-1q3l.onrender.com/api/speedtest/download')"
         }
     }
+
+@app.get("/api/speedtest/network", tags=["Network"])
+async def network_info(request: Request):
+    """Get network details only."""
+    return await get_network_details(request)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    # Use environment variables or remove completely
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

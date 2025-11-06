@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Network Speed Test</title>
+    <script>
+        async function measureDownloadSpeed() {
+            const startTime = performance.now();
+            const size = 5; // 5MB
+            try {
+                const response = await fetch(`/api/speedtest/download-data?size_mb=${size}`);
+                const reader = response.body.getReader();
+                let bytesReceived = 0;
+
+                while(true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    bytesReceived += value.length;
+                }
+
+                const endTime = performance.now();
+                const durationSec = (endTime - startTime) / 1000;
+                const speedMbps = (bytesReceived * 8) / (durationSec * 1000000);
+                
+                return {
+                    size_mb: size,
+                    duration_sec: Math.round(durationSec * 1000) / 1000,
+                    speed_mbps: Math.round(speedMbps * 100) / 100
+                };
+            } catch (err) {
+                console.error('Download test failed:', err);
+                return null;
+            }
+        }
+
+        async function runSpeedTest() {
+            document.getElementById('results').textContent = 'Testing...';
+            
+            // Run multiple tests
+            let bestDownload = { speed_mbps: 0 };
+            for(let i = 0; i < 3; i++) {
+                const result = await measureDownloadSpeed();
+                if (result && result.speed_mbps > bestDownload.speed_mbps) {
+                    bestDownload = result;
+                }
+                await new Promise(r => setTimeout(r, 500)); // 500ms pause between tests
+            }
+
+            // Get network info
+            const networkInfo = await fetch('/api/speedtest/network').then(r => r.json());
+
+            const results = {
+                summary: {
+                    download_speed_mbps: bestDownload.speed_mbps,
+                    tests_per_direction: 3
+                },
+                details: {
+                    download: bestDownload,
+                    network: networkInfo
+                }
+            };
+
+            document.getElementById('results').textContent = JSON.stringify(results, null, 2);
+        }
+    </script>
+</head>
+<body>
+    <h1>Network Speed Test</h1>
+    <button onclick="runSpeedTest()">Start Test</button>
+    <pre id="results"></pre>
+</body>
+</html>
