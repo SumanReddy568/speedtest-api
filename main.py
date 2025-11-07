@@ -2,8 +2,8 @@
 # Install: pip install fastapi uvicorn python-multipart
 
 from fastapi import FastAPI, Request, UploadFile
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import time
 import os
 import requests
@@ -14,8 +14,17 @@ import asyncio
 
 app = FastAPI(
     title="Internet Speed Test API",
-    version="3.0.0",
-    description="API for testing real client network speeds"
+    version="4.0.0",
+    description="API for testing client network speeds"
+)
+
+# Enable CORS for browser clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 def is_private_ip(ip: str) -> bool:
@@ -28,23 +37,18 @@ def is_private_ip(ip: str) -> bool:
 async def get_network_details(request: Request) -> Dict[str, Any]:
     """Get network details including IPs and location data."""
     try:
-        # Get server details
         hostname = socket.gethostname()
         server_ip = socket.gethostbyname(hostname)
-        
-        # Get client IP
         client_ip = request.client.host
         
-        # Get public IP for geolocation if we're dealing with private IPs
-        if is_private_ip(client_ip):
-            try:
-                public_ip = requests.get('https://api.ipify.org?format=json', timeout=2).json()['ip']
-            except:
-                public_ip = None
-        else:
-            public_ip = client_ip
-            
-        # Additional network info
+        # Get real client IP from headers (for reverse proxy scenarios)
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            client_ip = forwarded_for.split(",")[0].strip()
+        
+        # Get public IP
+        public_ip = client_ip if not is_private_ip(client_ip) else None
+        
         network_info = {
             "server": {
                 "hostname": hostname,
@@ -56,15 +60,15 @@ async def get_network_details(request: Request) -> Dict[str, Any]:
                 "public_ip": public_ip,
                 "is_private": is_private_ip(client_ip),
                 "location": {
-                    "country": "Local Network",
-                    "city": "Local Network",
-                    "isp": "Local Network"
+                    "country": "Unknown",
+                    "city": "Unknown",
+                    "isp": "Unknown"
                 }
             }
         }
         
-        # Only try geolocation for public IPs
-        if public_ip and not is_private_ip(public_ip):
+        # Get geolocation for client
+        if public_ip:
             try:
                 ip_info = requests.get(f"http://ip-api.com/json/{public_ip}", timeout=2).json()
                 if ip_info.get('status') == 'success':
@@ -86,54 +90,121 @@ async def get_network_details(request: Request) -> Dict[str, Any]:
             "client": {"ip": request.client.host}
         }
 
-async def measure_latency(request: Request) -> float:
-    """Measure latency by timing a simple request."""
-    start = time.time()
-    # Client should send timestamp and we calculate RTT
-    # For now, return minimal processing time
-    await asyncio.sleep(0.001)  # Simulate minimal processing
-    return round((time.time() - start) * 1000, 2)
-
-@app.get("/", tags=["Info"])
+@app.get("/", response_class=HTMLResponse, tags=["Info"])
 async def root():
-    """Get API information and available endpoints."""
-    return {
-        "message": "Welcome to the Internet Speed Test API",
-        "note": "This API measures YOUR (client's) network speed",
-        "base_url": "https://speedtest-api-1q3l.onrender.com",
-        "routes": {
-            "info": "/",
-            "docs": "/docs",
-            "ping": "/api/speedtest/ping",
-            "download": "/api/speedtest/download?size_mb=10",
-            "upload": "/api/speedtest/upload (POST with file)",
-            "test": "/api/speedtest/test",
-            "network": "/api/speedtest/network"
+    """Serve interactive speed test page."""
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Speed Test</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px; }
+        button { width: 100%; padding: 15px; font-size: 18px; background: #4CAF50; color: white; border: none; cursor: pointer; border-radius: 5px; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .result { margin: 20px 0; padding: 15px; background: #f5f5f5; border-radius: 5px; }
+        .speed { font-size: 32px; font-weight: bold; color: #4CAF50; }
+        .label { color: #666; margin-bottom: 5px; }
+        .status { text-align: center; margin: 15px 0; color: #666; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <h1>🚀 Internet Speed Test</h1>
+    <button onclick="runTest()" id="btn">Start Test</button>
+    <div class="status" id="status">Click to start</div>
+    
+    <div class="grid">
+        <div class="result">
+            <div class="label">Download</div>
+            <div class="speed" id="download">-- Mbps</div>
+        </div>
+        <div class="result">
+            <div class="label">Upload</div>
+            <div class="speed" id="upload">-- Mbps</div>
+        </div>
+    </div>
+    
+    <div class="result" id="info" style="display:none;">
+        <div class="label">Your Location</div>
+        <div id="location">--</div>
+        <div class="label" style="margin-top:10px;">ISP</div>
+        <div id="isp">--</div>
+        <div class="label" style="margin-top:10px;">Latency</div>
+        <div id="latency">--</div>
+    </div>
+
+    <script>
+        async function runTest() {
+            const btn = document.getElementById('btn');
+            btn.disabled = true;
+            
+            try {
+                // Test Download
+                document.getElementById('status').textContent = 'Testing download...';
+                const dlStart = performance.now();
+                const dlResponse = await fetch('/api/speedtest/download?size_mb=10');
+                const dlData = await dlResponse.arrayBuffer();
+                const dlEnd = performance.now();
+                const dlSpeed = (10 * 8) / ((dlEnd - dlStart) / 1000);
+                document.getElementById('download').textContent = dlSpeed.toFixed(2) + ' Mbps';
+                
+                // Test Upload
+                document.getElementById('status').textContent = 'Testing upload...';
+                const uploadData = new Uint8Array(5 * 1024 * 1024);
+                const blob = new Blob([uploadData]);
+                const formData = new FormData();
+                formData.append('file', blob, 'test.bin');
+                
+                const upResponse = await fetch('/api/speedtest/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const upResult = await upResponse.json();
+                document.getElementById('upload').textContent = upResult.speed_mbps + ' Mbps';
+                
+                // Get network info
+                document.getElementById('status').textContent = 'Getting location...';
+                const infoResponse = await fetch('/api/speedtest/network');
+                const info = await infoResponse.json();
+                
+                const loc = info.client.location;
+                document.getElementById('location').textContent = loc.city + ', ' + loc.country;
+                document.getElementById('isp').textContent = loc.isp;
+                document.getElementById('info').style.display = 'block';
+                
+                // Test latency
+                const pingStart = performance.now();
+                await fetch('/api/speedtest/ping');
+                const pingEnd = performance.now();
+                document.getElementById('latency').textContent = (pingEnd - pingStart).toFixed(0) + ' ms';
+                
+                document.getElementById('status').textContent = '✅ Test complete!';
+            } catch (error) {
+                document.getElementById('status').textContent = '❌ Error: ' + error.message;
+            } finally {
+                btn.disabled = false;
+            }
         }
-    }
+    </script>
+</body>
+</html>
+    """
 
 @app.get("/api/speedtest/ping", tags=["Speed Test"])
-async def test_ping(request: Request):
-    """Measure latency between client and server."""
-    return {
-        "timestamp": time.time(),
-        "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "note": "Client should measure round-trip time (RTT)"
-    }
+async def test_ping():
+    """Ping endpoint for latency measurement."""
+    return {"timestamp": time.time()}
 
 @app.get("/api/speedtest/download", tags=["Speed Test"])
 async def test_download(size_mb: int = 10):
     """
-    Stream random data for download speed test.
-    CLIENT must measure time from first to last byte.
-    
-    Usage:
-    1. Record start time when first byte arrives
-    2. Record end time when last byte arrives
-    3. Calculate: speed_mbps = (size_mb * 8) / duration_seconds
+    Stream data for download speed test.
+    Client measures time to download.
     """
     def generate():
-        chunk_size = 256 * 1024  # 256KB chunks
+        chunk_size = 256 * 1024
         total_bytes = size_mb * 1024 * 1024
         bytes_sent = 0
         
@@ -147,8 +218,6 @@ async def test_download(size_mb: int = 10):
         media_type="application/octet-stream",
         headers={
             "Content-Length": str(size_mb * 1024 * 1024),
-            "X-Test-Start": str(time.time()),
-            "X-Size-MB": str(size_mb),
             "Cache-Control": "no-cache"
         }
     )
@@ -156,97 +225,46 @@ async def test_download(size_mb: int = 10):
 @app.post("/api/speedtest/upload", tags=["Speed Test"])
 async def test_upload(file: UploadFile):
     """
-    Receive file and measure upload speed.
-    This measures CLIENT's upload speed (how fast they can send to server).
+    Receive file upload. Returns file size and timestamp for client-side speed calculation.
+    Client should measure their own upload time for accurate results.
     """
-    start_time = time.time()
     size = 0
-    
     chunk_size = 256 * 1024
     while chunk := await file.read(chunk_size):
         size += len(chunk)
     
-    duration = time.time() - start_time
-    size_mb = size / (1024 * 1024)
-    speed_mbps = (size_mb * 8) / duration if duration > 0 else 0
-    
     return {
-        "test_type": "upload",
-        "file": file.filename,
-        "size_mb": round(size_mb, 2),
-        "duration_sec": round(duration, 3),
-        "speed_mbps": round(speed_mbps, 2),
-        "note": "This is YOUR upload speed (client to server)"
-    }
-
-@app.get("/api/speedtest/test", tags=["Speed Test"])
-async def full_speed_test(request: Request):
-    """
-    Get network information and test instructions.
-    
-    IMPORTANT: This endpoint only provides network info.
-    For actual speed measurements, you must:
-    
-    1. Download Test:
-       - Call GET /api/speedtest/download?size_mb=10
-       - Measure time from first byte to last byte on CLIENT side
-       - Calculate: speed_mbps = (10 * 8) / duration_seconds
-    
-    2. Upload Test:
-       - Generate random data on client
-       - POST to /api/speedtest/upload
-       - Server returns your upload speed
-    
-    3. Latency Test:
-       - Call GET /api/speedtest/ping
-       - Measure round-trip time on CLIENT side
-    """
-    
-    # Get network details
-    network_details = await get_network_details(request)
-    
-    # Measure basic latency
-    latency = await measure_latency(request)
-    
-    return {
-        "test_type": "speed_test_info",
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "server_latency_ms": latency,
-        "network": network_details,
-        "instructions": {
-            "note": "This endpoint only provides info. For actual speeds:",
-            "download_test": {
-                "endpoint": "GET /api/speedtest/download?size_mb=10",
-                "client_action": "Measure time from first to last byte",
-                "calculation": "speed_mbps = (size_mb * 8) / duration_seconds"
-            },
-            "upload_test": {
-                "endpoint": "POST /api/speedtest/upload",
-                "client_action": "Send file, server returns your upload speed",
-                "note": "Server measures how fast it receives your data"
-            },
-            "latency_test": {
-                "endpoint": "GET /api/speedtest/ping",
-                "client_action": "Measure round-trip time (send request -> receive response)"
-            }
-        },
-        "why_client_side": "Network speed must be measured by timing actual data transfer over the network. Server-side generation of random data doesn't measure network speed - it only measures server's memory/CPU speed.",
-        "example_clients": {
-            "curl_download": "time curl -o /dev/null https://speedtest-api-1q3l.onrender.com/api/speedtest/download?size_mb=10",
-            "curl_upload": "curl -X POST -F 'file=@testfile.bin' https://speedtest-api-1q3l.onrender.com/api/speedtest/upload",
-            "python": "requests.get('https://speedtest-api-1q3l.onrender.com/api/speedtest/download')",
-            "javascript": "fetch('https://speedtest-api-1q3l.onrender.com/api/speedtest/download')"
-        }
+        "size_bytes": size,
+        "size_mb": round(size / (1024 * 1024), 2),
+        "server_timestamp": time.time(),
+        "note": "Calculate speed on client side: (size_mb * 8) / upload_duration_seconds"
     }
 
 @app.get("/api/speedtest/network", tags=["Network"])
 async def network_info(request: Request):
-    """Get network details only."""
+    """Get client network details."""
     return await get_network_details(request)
+
+@app.get("/api/speedtest/test", tags=["Speed Test"])
+async def speed_test_info(request: Request):
+    """
+    Get network info and instructions.
+    For actual speed test, visit the root URL (/) for interactive test.
+    """
+    network = await get_network_details(request)
+    
+    return {
+        "message": "Speed tests are performed client-side for accuracy",
+        "your_network": network,
+        "to_test_speed": {
+            "interactive": "Visit / in browser for the most accurate results",
+            "api_download": "GET /api/speedtest/download?size_mb=10 and measure time client-side",
+            "api_upload": "POST /api/speedtest/upload with file and measure time client-side"
+        },
+        "note": "All speed measurements should be done on the client side for accurate results"
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
-    # Use environment variables or remove completely
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
